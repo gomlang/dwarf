@@ -1,0 +1,8 @@
+package tests;
+
+use consumer::dwarf as app;
+
+#[test]
+fn versioned_dwarf_api() -> () {
+    app::exercise();
+}
