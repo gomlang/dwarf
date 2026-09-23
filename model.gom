@@ -1,0 +1,173 @@
+package dwarf;
+
+use std::bytes;
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Endian {
+    Little,
+    Big,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    Truncated,
+    Invalid,
+    Unsupported,
+    Limit,
+    Utf8,
+    Io,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Error {
+    pub kind: ErrorKind,
+    pub section: string,
+    pub offset: isize,
+    pub message: string,
+}
+
+impl ToString for Error {
+    fn to_string(self: Error) -> string {
+        f"{self.section}+{self.offset}: {self.message}"
+    }
+}
+
+fn failure(kind: ErrorKind, section: string, offset: isize, message: string) -> Error {
+    Error { kind, section, offset, message }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Limits {
+    pub max_total_bytes: isize,
+    pub max_section_bytes: isize,
+    pub max_units: isize,
+    pub max_abbrevs: isize,
+    pub max_entries: isize,
+    pub max_attributes: isize,
+    pub max_string_bytes: isize,
+    pub max_decoded_text_bytes: isize,
+    pub max_line_files: isize,
+    pub max_line_rows: isize,
+}
+
+impl Limits {
+    pub fn standard() -> Limits {
+        Limits {
+            max_total_bytes: 67108864,
+            max_section_bytes: 33554432,
+            max_units: 4096,
+            max_abbrevs: 100000,
+            max_entries: 1000000,
+            max_attributes: 4000000,
+            max_string_bytes: 1048576,
+            max_decoded_text_bytes: 67108864,
+            max_line_files: 100000,
+            max_line_rows: 1000000,
+        }
+    }
+
+    pub fn validate(self: Limits) -> Result[(), Error] {
+        if self.max_total_bytes < 0 || self.max_section_bytes < 0 || self.max_units < 0
+            || self.max_abbrevs < 0
+            || self.max_entries < 0
+            || self.max_attributes < 0
+            || self.max_string_bytes < 0
+            || self.max_decoded_text_bytes < 0
+            || self.max_line_files < 0
+            || self.max_line_rows < 0 {
+            Result::Err(failure(ErrorKind::Limit, "sections", 0, "negative limit"))
+        } else {
+            Result::Ok(())
+        }
+    }
+}
+
+pub struct Sections {
+    pub info: bytes::Bytes,
+    pub abbrev: bytes::Bytes,
+    pub line: bytes::Bytes,
+    pub strings: bytes::Bytes,
+    pub line_strings: bytes::Bytes,
+}
+
+impl Sections {
+    pub fn empty() -> Sections {
+        Sections {
+            info: bytes::Bytes::new(),
+            abbrev: bytes::Bytes::new(),
+            line: bytes::Bytes::new(),
+            strings: bytes::Bytes::new(),
+            line_strings: bytes::Bytes::new(),
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Span {
+    pub offset: isize,
+    pub size: isize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SectionSpans {
+    pub info: Span,
+    pub abbrev: Span,
+    pub line: Span,
+    pub strings: Span,
+    pub line_strings: Span,
+}
+
+pub enum Value {
+    Unsigned(u64),
+    Signed(i64),
+    Text(string),
+    Bytes(bytes::Bytes),
+    Flag(bool),
+    Reference(u64),
+}
+
+pub struct Attribute {
+    pub name: u64,
+    pub form: u64,
+    pub value: Value,
+}
+
+pub struct Entry {
+    pub offset: isize,
+    pub depth: isize,
+    pub tag: u64,
+    pub has_children: bool,
+    pub attributes: Vec[Attribute],
+}
+
+pub struct Unit {
+    pub offset: isize,
+    pub end: isize,
+    pub version: u16,
+    pub unit_type: byte,
+    pub address_size: byte,
+    pub abbrev_offset: isize,
+    pub entries: Vec[Entry],
+}
+
+#[derive(PartialEq, Eq)]
+pub struct LineRow {
+    pub address: u64,
+    pub file: isize,
+    pub line: i64,
+    pub column: u64,
+    pub is_stmt: bool,
+    pub end_sequence: bool,
+}
+
+pub struct LineTable {
+    pub offset: isize,
+    pub version: u16,
+    pub files: Vec[string],
+    pub rows: Vec[LineRow],
+}
+
+pub struct Data {
+    pub units: Vec[Unit],
+    pub line_tables: Vec[LineTable],
+}

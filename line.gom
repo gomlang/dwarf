@@ -1,0 +1,569 @@
+package dwarf;
+
+struct LineField {
+    content: u64,
+    form: u64,
+}
+
+fn line_form(reader: Reader, form: u64, sections: Sections, limits: Limits, decoded: Ref[isize]) -> Result[
+    Value,
+    Error,
+] {
+    match form {
+        0x08 => Result::Ok(
+            Value::Text(
+                reader.cstring(limits.max_string_bytes, decoded, limits.max_decoded_text_bytes)?,
+            ),
+        ),
+        0x0e => Result::Ok(
+            Value::Text(
+                string_at(
+                    sections.strings,
+                    reader.read(4)?,
+                    limits.max_string_bytes,
+                    decoded,
+                    limits.max_decoded_text_bytes,
+                    ".debug_str",
+                )?,
+            ),
+        ),
+        0x1f => Result::Ok(
+            Value::Text(
+                string_at(
+                    sections.line_strings,
+                    reader.read(4)?,
+                    limits.max_string_bytes,
+                    decoded,
+                    limits.max_decoded_text_bytes,
+                    ".debug_line_str",
+                )?,
+            ),
+        ),
+        0x0b => Result::Ok(Value::Unsigned(reader.read(1)?)),
+        0x05 => Result::Ok(Value::Unsigned(reader.read(2)?)),
+        0x06 => Result::Ok(Value::Unsigned(reader.read(4)?)),
+        0x07 => Result::Ok(Value::Unsigned(reader.read(8)?)),
+        0x0f => Result::Ok(Value::Unsigned(reader.uleb()?)),
+        0x1e => Result::Ok(Value::Bytes(reader.take(16)?)),
+        _ => Result::Err(
+            failure(
+                ErrorKind::Unsupported,
+                ".debug_line",
+                reader.position(),
+                f"unsupported line form {form}",
+            ),
+        ),
+    }
+}
+
+fn line_formats(reader: Reader) -> Result[Vec[LineField], Error] {
+    let count = reader.read(1)?.to_isize();
+    let fields: Vec[LineField] = Vec::new();
+    for _ in 0..count {
+        fields.push(LineField { content: reader.uleb()?, form: reader.uleb()? });
+    }
+    Result::Ok(fields)
+}
+
+fn line_path(
+    reader: Reader,
+    fields: Vec[LineField],
+    sections: Sections,
+    limits: Limits,
+    decoded: Ref[isize],
+) -> Result[(string, u64), Error] {
+    let mut path = "";
+    let mut directory = 0;
+    for field in fields {
+        let value = line_form(reader, field.form, sections, limits, decoded)?;
+        if field.content == 1 {
+            if let Value::Text(text) = value {
+                path = text;
+            } else {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Invalid,
+                        ".debug_line",
+                        reader.position(),
+                        "line path is not text",
+                    ),
+                )
+            }
+        } else if field.content == 2 {
+            if let Value::Unsigned(index) = value {
+                directory = index;
+            } else {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Invalid,
+                        ".debug_line",
+                        reader.position(),
+                        "directory index is not numeric",
+                    ),
+                )
+            }
+        }
+    }
+    if path == "" {
+        return Result::Err(
+            failure(ErrorKind::Invalid, ".debug_line", reader.position(), "missing line path"),
+        )
+    }
+    Result::Ok((path, directory))
+}
+
+fn combine_path(directory: string, file: string, decoded: Ref[isize], limits: Limits, offset: isize) -> Result[
+    string,
+    Error,
+] {
+    if file.starts_with("/") || directory == "" {
+        Result::Ok(file)
+    } else if directory.ends_with("/") {
+        let remaining = limits.max_decoded_text_bytes - decoded.get();
+        if directory.byte_len() > remaining || file.byte_len() > remaining - directory.byte_len() {
+            return Result::Err(
+                failure(ErrorKind::Limit, ".debug_line", offset, "decoded text byte limit exceeded"),
+            )
+        }
+        charge_text(
+            directory.byte_len() + file.byte_len(),
+            decoded,
+            limits.max_decoded_text_bytes,
+            ".debug_line",
+            offset,
+        )?;
+        Result::Ok(directory + file)
+    } else {
+        let remaining = limits.max_decoded_text_bytes - decoded.get();
+        if directory.byte_len() >= remaining
+            || file.byte_len() > remaining - directory.byte_len() - 1 {
+            return Result::Err(
+                failure(ErrorKind::Limit, ".debug_line", offset, "decoded text byte limit exceeded"),
+            )
+        }
+        charge_text(
+            directory.byte_len() + 1 + file.byte_len(),
+            decoded,
+            limits.max_decoded_text_bytes,
+            ".debug_line",
+            offset,
+        )?;
+        Result::Ok(directory + "/" + file)
+    }
+}
+
+fn append_file(
+    files: Vec[string],
+    directories: Vec[string],
+    name: string,
+    directory: u64,
+    limits: Limits,
+    offset: isize,
+    decoded: Ref[isize],
+    sentinel: bool,
+) -> Result[(), Error] {
+    let real_files = files.len()
+        - if sentinel {
+            1
+        } else {
+            0
+        };
+    if real_files >= limits.max_line_files {
+        return Result::Err(
+            failure(ErrorKind::Limit, ".debug_line", offset, "line file limit exceeded"),
+        )
+    }
+    if name.starts_with("/") {
+        files.push(name);
+        return Result::Ok(())
+    }
+    if directory >= directories.len().to_u64() {
+        return Result::Err(
+            failure(ErrorKind::Invalid, ".debug_line", offset, "directory index outside table"),
+        )
+    }
+    files.push(combine_path(directories[directory.to_isize()], name, decoded, limits, offset)?);
+    Result::Ok(())
+}
+
+fn advance_address(
+    address: u64,
+    op_index: u64,
+    steps: u64,
+    min_length: u64,
+    max_ops: u64,
+    offset: isize,
+) -> Result[(u64, u64), Error] {
+    if steps > 18446744073709551615 - op_index {
+        return Result::Err(
+            failure(ErrorKind::Invalid, ".debug_line", offset, "operation index overflow"),
+        )
+    }
+    let operation = op_index + steps;
+    let instructions = operation / max_ops;
+    if min_length != 0 && instructions > (18446744073709551615 - address) / min_length {
+        return Result::Err(
+            failure(ErrorKind::Invalid, ".debug_line", offset, "line address overflow"),
+        )
+    }
+    Result::Ok((address + instructions * min_length, operation % max_ops))
+}
+
+fn change_line(current: i64, change: i64, offset: isize) -> Result[i64, Error] {
+    if current < -1000000000 || current > 1000000000 || change < -1000000000 || change > 1000000000 {
+        return Result::Err(
+            failure(ErrorKind::Limit, ".debug_line", offset, "line number limit exceeded"),
+        )
+    }
+    let result = current + change;
+    if result < -1000000000 || result > 1000000000 {
+        return Result::Err(
+            failure(ErrorKind::Limit, ".debug_line", offset, "line number limit exceeded"),
+        )
+    }
+    Result::Ok(result)
+}
+
+fn emit_row(
+    rows: Vec[LineRow],
+    address: u64,
+    file: isize,
+    line: i64,
+    column: u64,
+    is_stmt: bool,
+    end_sequence: bool,
+    limits: Limits,
+    offset: isize,
+) -> Result[(), Error] {
+    if rows.len() >= limits.max_line_rows {
+        return Result::Err(
+            failure(ErrorKind::Limit, ".debug_line", offset, "line row limit exceeded"),
+        )
+    }
+    rows.push(LineRow { address, file, line, column, is_stmt, end_sequence });
+    Result::Ok(())
+}
+
+fn parse_line_table(
+    sections: Sections,
+    offset: isize,
+    unit_address_size: byte,
+    comp_dir: string,
+    endian: Endian,
+    limits: Limits,
+    decoded: Ref[isize],
+) -> Result[LineTable, Error] {
+    let outer = Reader::new(sections.line, offset, sections.line.len(), endian, ".debug_line")?;
+    let length = read_length(outer)?;
+    let end = outer.position() + length;
+    let reader = Reader::new(sections.line, outer.position(), end, endian, ".debug_line")?;
+    let version = reader.read(2)?.to_u16();
+    if version < 2 || version > 5 {
+        return Result::Err(
+            failure(ErrorKind::Unsupported, ".debug_line", offset, "unsupported line table version"),
+        )
+    }
+    let mut address_size = unit_address_size;
+    if version == 5 {
+        address_size = reader.read(1)?.to_u8();
+        if reader.read(1)? != 0 {
+            return Result::Err(
+                failure(ErrorKind::Unsupported, ".debug_line", offset, "segmented line addresses"),
+            )
+        }
+    }
+    if address_size != 1 && address_size != 2 && address_size != 4 && address_size != 8 {
+        return Result::Err(
+            failure(ErrorKind::Unsupported, ".debug_line", offset, "unsupported line address size"),
+        )
+    }
+    let header_length = reader.read(4)?;
+    if header_length > reader.remaining().to_u64() {
+        return Result::Err(
+            failure(ErrorKind::Truncated, ".debug_line", offset, "truncated line header"),
+        )
+    }
+    let header_end = reader.position() + header_length.to_isize();
+    let min_length = reader.read(1)?;
+    let max_ops = if version >= 4 {
+        reader.read(1)?
+    } else {
+        1
+    };
+    let default_is_stmt = reader.read(1)? != 0;
+    let base_byte = reader.read(1)?;
+    let line_base: i64 = if base_byte >= 128 {
+        base_byte.to_i64() - 256
+    } else {
+        base_byte.to_i64()
+    };
+    let line_range = reader.read(1)?;
+    let opcode_base = reader.read(1)?;
+    if max_ops == 0 || line_range == 0 || opcode_base == 0 {
+        return Result::Err(
+            failure(ErrorKind::Invalid, ".debug_line", offset, "invalid line program parameters"),
+        )
+    }
+    let opcode_lengths: Vec[u64] = Vec::from_array([0]);
+    for _ in 1..opcode_base.to_isize() {
+        opcode_lengths.push(reader.read(1)?);
+    }
+    let directories: Vec[string] = Vec::new();
+    let files: Vec[string] = Vec::new();
+    if version < 5 {
+        directories.push(comp_dir);
+        files.push("");
+        loop {
+            let name = reader.cstring(
+                limits.max_string_bytes,
+                decoded,
+                limits.max_decoded_text_bytes,
+            )?;
+            if name == "" {
+                break
+            }
+            if directories.len() >= limits.max_line_files {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Limit,
+                        ".debug_line",
+                        reader.position(),
+                        "line directory limit exceeded",
+                    ),
+                )
+            }
+            directories.push(combine_path(comp_dir, name, decoded, limits, reader.position())?);
+        }
+        loop {
+            let name = reader.cstring(
+                limits.max_string_bytes,
+                decoded,
+                limits.max_decoded_text_bytes,
+            )?;
+            if name == "" {
+                break
+            }
+            let directory = reader.uleb()?;
+            reader.uleb()?;
+            reader.uleb()?;
+            append_file(
+                files,
+                directories,
+                name,
+                directory,
+                limits,
+                reader.position(),
+                decoded,
+                true,
+            )?;
+        }
+    } else {
+        let dir_fields = line_formats(reader)?;
+        let dir_count = reader.uleb()?;
+        if dir_count > limits.max_line_files.to_u64() {
+            return Result::Err(
+                failure(
+                    ErrorKind::Limit,
+                    ".debug_line",
+                    reader.position(),
+                    "line directory limit exceeded",
+                ),
+            )
+        }
+        for _ in 0..dir_count.to_isize() {
+            let (path, _) = line_path(reader, dir_fields, sections, limits, decoded)?;
+            directories.push(combine_path(comp_dir, path, decoded, limits, reader.position())?);
+        }
+        let file_fields = line_formats(reader)?;
+        let file_count = reader.uleb()?;
+        if file_count > limits.max_line_files.to_u64() {
+            return Result::Err(
+                failure(
+                    ErrorKind::Limit,
+                    ".debug_line",
+                    reader.position(),
+                    "line file limit exceeded",
+                ),
+            )
+        }
+        for _ in 0..file_count.to_isize() {
+            let (name, directory) = line_path(reader, file_fields, sections, limits, decoded)?;
+            append_file(
+                files,
+                directories,
+                name,
+                directory,
+                limits,
+                reader.position(),
+                decoded,
+                false,
+            )?;
+        }
+    }
+    if reader.position() > header_end {
+        return Result::Err(
+            failure(
+                ErrorKind::Invalid,
+                ".debug_line",
+                offset,
+                "line header exceeds declared length",
+            ),
+        )
+    }
+    reader.pos.set(header_end);
+    let rows: Vec[LineRow] = Vec::new();
+    let mut address: u64 = 0;
+    let mut op_index: u64 = 0;
+    let mut file: isize = 1;
+    let mut line: i64 = 1;
+    let mut column: u64 = 0;
+    let mut is_stmt = default_is_stmt;
+    while reader.remaining() > 0 {
+        let at = reader.position();
+        let opcode = reader.read(1)?;
+        let mut emit = false;
+        let mut end_sequence = false;
+        if opcode == 0 {
+            let size = reader.uleb()?;
+            if size == 0 || size > reader.remaining().to_u64() {
+                return Result::Err(
+                    failure(ErrorKind::Truncated, ".debug_line", at, "truncated extended opcode"),
+                )
+            }
+            let extended_end = reader.position() + size.to_isize();
+            let operation = reader.read(1)?;
+            if operation == 1 {
+                emit = true;
+                end_sequence = true;
+            } else if operation == 2 {
+                address = reader.read(address_size.to_isize())?;
+                op_index = 0;
+            } else if operation == 3 && version < 5 {
+                let name = reader.cstring(
+                    limits.max_string_bytes,
+                    decoded,
+                    limits.max_decoded_text_bytes,
+                )?;
+                let directory = reader.uleb()?;
+                reader.uleb()?;
+                reader.uleb()?;
+                append_file(files, directories, name, directory, limits, at, decoded, true)?;
+            } else if operation == 3 {
+                return Result::Err(
+                    failure(ErrorKind::Unsupported, ".debug_line", at, "DWARF5 define_file opcode"),
+                )
+            } else if operation == 4 {
+                reader.uleb()?;
+            }
+            if reader.position() > extended_end {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, ".debug_line", at, "extended opcode exceeds length"),
+                )
+            }
+            reader.pos.set(extended_end);
+        } else if opcode >= opcode_base {
+            let adjusted = opcode - opcode_base;
+            let (next_address, next_index) = advance_address(
+                address,
+                op_index,
+                adjusted / line_range,
+                min_length,
+                max_ops,
+                at,
+            )?;
+            address = next_address;
+            op_index = next_index;
+            line = change_line(line, line_base + (adjusted % line_range).to_i64(), at)?;
+            emit = true;
+        } else {
+            match opcode {
+                1 => {
+                    emit = true;
+                },
+                2 => {
+                    let (next_address, next_index) = advance_address(
+                        address,
+                        op_index,
+                        reader.uleb()?,
+                        min_length,
+                        max_ops,
+                        at,
+                    )?;
+                    address = next_address;
+                    op_index = next_index;
+                },
+                3 => {
+                    line = change_line(line, reader.sleb()?, at)?;
+                },
+                4 => {
+                    let index = reader.uleb()?;
+                    if index >= files.len().to_u64() {
+                        return Result::Err(
+                            failure(
+                                ErrorKind::Invalid,
+                                ".debug_line",
+                                at,
+                                "file index outside table",
+                            ),
+                        )
+                    }
+                    file = index.to_isize();
+                },
+                5 => {
+                    column = reader.uleb()?;
+                },
+                6 => {
+                    is_stmt = !is_stmt;
+                },
+                7 | 10 | 11 => (),
+                8 => {
+                    let (next_address, next_index) = advance_address(
+                        address,
+                        op_index,
+                        (255 - opcode_base) / line_range,
+                        min_length,
+                        max_ops,
+                        at,
+                    )?;
+                    address = next_address;
+                    op_index = next_index;
+                },
+                9 => {
+                    let delta = reader.read(2)?;
+                    if delta > 18446744073709551615 - address {
+                        return Result::Err(
+                            failure(ErrorKind::Invalid, ".debug_line", at, "line address overflow"),
+                        )
+                    }
+                    address += delta;
+                    op_index = 0;
+                },
+                12 => {
+                    reader.uleb()?;
+                },
+                _ => {
+                    for _ in 0..opcode_lengths[opcode.to_isize()].to_isize() {
+                        reader.uleb()?;
+                    }
+                },
+            }
+        }
+        if emit {
+            if file < 0 || file >= files.len() {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, ".debug_line", at, "line file index outside table"),
+                )
+            }
+            emit_row(rows, address, file, line, column, is_stmt, end_sequence, limits, at)?;
+            if end_sequence {
+                address = 0;
+                op_index = 0;
+                file = 1;
+                line = 1;
+                column = 0;
+                is_stmt = default_is_stmt;
+            }
+        }
+    }
+    Result::Ok(LineTable { offset, version, files, rows })
+}

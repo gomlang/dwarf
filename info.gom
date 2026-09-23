@@ -1,0 +1,440 @@
+package dwarf;
+
+struct Spec {
+    name: u64,
+    form: u64,
+    constant: i64,
+}
+
+struct Abbrev {
+    tag: u64,
+    children: bool,
+    specs: Vec[Spec],
+}
+
+fn abbrevs(data: Sections, offset: isize, endian: Endian, limits: Limits, count: Ref[isize]) -> Result[
+    HashMap[u64, Abbrev],
+    Error,
+] {
+    let reader = Reader::new(data.abbrev, offset, data.abbrev.len(), endian, ".debug_abbrev")?;
+    let result: HashMap[u64, Abbrev] = HashMap::new();
+    loop {
+        let code = reader.uleb()?;
+        if code == 0 {
+            break
+        }
+        if count.get() >= limits.max_abbrevs {
+            return Result::Err(
+                failure(
+                    ErrorKind::Limit,
+                    ".debug_abbrev",
+                    reader.position(),
+                    "abbreviation limit exceeded",
+                ),
+            )
+        }
+        count.set(count.get() + 1);
+        if result.contains(code) {
+            return Result::Err(
+                failure(
+                    ErrorKind::Invalid,
+                    ".debug_abbrev",
+                    reader.position(),
+                    "duplicate abbreviation code",
+                ),
+            )
+        }
+        let tag = reader.uleb()?;
+        let children = reader.read(1)?;
+        if children > 1 {
+            return Result::Err(
+                failure(
+                    ErrorKind::Invalid,
+                    ".debug_abbrev",
+                    reader.position(),
+                    "invalid children flag",
+                ),
+            )
+        }
+        let specs: Vec[Spec] = Vec::new();
+        loop {
+            let name = reader.uleb()?;
+            let form = reader.uleb()?;
+            if name == 0 && form == 0 {
+                break
+            }
+            if name == 0 || form == 0 {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Invalid,
+                        ".debug_abbrev",
+                        reader.position(),
+                        "invalid attribute specification",
+                    ),
+                )
+            }
+            if specs.len() >= limits.max_attributes {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Limit,
+                        ".debug_abbrev",
+                        reader.position(),
+                        "attribute limit exceeded",
+                    ),
+                )
+            }
+            let constant = if form == 0x21 {
+                reader.sleb()?
+            } else {
+                0
+            };
+            specs.push(Spec { name, form, constant });
+        }
+        result.insert(code, Abbrev { tag, children: children == 1, specs });
+    }
+    Result::Ok(result)
+}
+
+fn unit_reference(encoded: u64, unit_start: isize, unit_end: isize, at: isize) -> Result[
+    Value,
+    Error,
+] {
+    if encoded >= (unit_end - unit_start).to_u64()
+        || encoded > 18446744073709551615 - unit_start.to_u64() {
+        return Result::Err(
+            failure(ErrorKind::Invalid, ".debug_info", at, "reference outside compilation unit"),
+        )
+    }
+    Result::Ok(Value::Reference(unit_start.to_u64() + encoded))
+}
+
+fn form_value(
+    reader: Reader,
+    spec: Spec,
+    sections: Sections,
+    version: u16,
+    address_size: byte,
+    unit_start: isize,
+    unit_end: isize,
+    limits: Limits,
+    decoded: Ref[isize],
+) -> Result[(u64, Value), Error] {
+    let mut form = spec.form;
+    if form == 0x16 {
+        form = reader.uleb()?;
+        if form == 0x16 || form == 0x21 {
+            return Result::Err(
+                failure(
+                    ErrorKind::Unsupported,
+                    ".debug_info",
+                    reader.position(),
+                    "nested or implicit indirect form",
+                ),
+            )
+        }
+    }
+    let value = match form {
+        0x01 => Value::Unsigned(reader.read(address_size.to_isize())?),
+        0x03 => {
+            let length = reader.read(2)?;
+            if length > reader.remaining().to_u64() {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Truncated,
+                        ".debug_info",
+                        reader.position(),
+                        "truncated block",
+                    ),
+                )
+            }
+            Value::Bytes(reader.take(length.to_isize())?)
+        },
+        0x04 => {
+            let length = reader.read(4)?;
+            if length > reader.remaining().to_u64() {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Truncated,
+                        ".debug_info",
+                        reader.position(),
+                        "truncated block",
+                    ),
+                )
+            }
+            Value::Bytes(reader.take(length.to_isize())?)
+        },
+        0x05 => Value::Unsigned(reader.read(2)?),
+        0x06 => Value::Unsigned(reader.read(4)?),
+        0x07 => Value::Unsigned(reader.read(8)?),
+        0x08 => Value::Text(
+            reader.cstring(limits.max_string_bytes, decoded, limits.max_decoded_text_bytes)?,
+        ),
+        0x09 | 0x18 => {
+            let length = reader.uleb()?;
+            if length > reader.remaining().to_u64() {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Truncated,
+                        ".debug_info",
+                        reader.position(),
+                        "truncated block",
+                    ),
+                )
+            }
+            Value::Bytes(reader.take(length.to_isize())?)
+        },
+        0x0a => Value::Bytes(reader.take(reader.read(1)?.to_isize())?),
+        0x0b => Value::Unsigned(reader.read(1)?),
+        0x0c => Value::Flag(reader.read(1)? != 0),
+        0x0d => Value::Signed(reader.sleb()?),
+        0x0e => Value::Text(
+            string_at(
+                sections.strings,
+                reader.read(4)?,
+                limits.max_string_bytes,
+                decoded,
+                limits.max_decoded_text_bytes,
+                ".debug_str",
+            )?,
+        ),
+        0x0f => Value::Unsigned(reader.uleb()?),
+        0x10 => Value::Reference(
+            reader.read(
+                if version == 2 {
+                    address_size.to_isize()
+                } else {
+                    4
+                },
+            )?,
+        ),
+        0x11 => unit_reference(reader.read(1)?, unit_start, unit_end, reader.position())?,
+        0x12 => unit_reference(reader.read(2)?, unit_start, unit_end, reader.position())?,
+        0x13 => unit_reference(reader.read(4)?, unit_start, unit_end, reader.position())?,
+        0x14 => unit_reference(reader.read(8)?, unit_start, unit_end, reader.position())?,
+        0x15 => unit_reference(reader.uleb()?, unit_start, unit_end, reader.position())?,
+        0x17 => Value::Unsigned(reader.read(4)?),
+        0x19 => Value::Flag(true),
+        0x1e => Value::Bytes(reader.take(16)?),
+        0x1f => Value::Text(
+            string_at(
+                sections.line_strings,
+                reader.read(4)?,
+                limits.max_string_bytes,
+                decoded,
+                limits.max_decoded_text_bytes,
+                ".debug_line_str",
+            )?,
+        ),
+        0x20 => Value::Reference(reader.read(8)?),
+        0x21 => Value::Signed(spec.constant),
+        _ => return Result::Err(
+            failure(
+                ErrorKind::Unsupported,
+                ".debug_info",
+                reader.position(),
+                f"unsupported form {form}",
+            ),
+        ),
+    };
+    Result::Ok((form, value))
+}
+
+fn parse_unit(
+    sections: Sections,
+    outer: Reader,
+    endian: Endian,
+    limits: Limits,
+    tables: HashMap[isize, HashMap[u64, Abbrev]],
+    abbrev_count: Ref[isize],
+    entry_count: Ref[isize],
+    attribute_count: Ref[isize],
+    decoded: Ref[isize],
+) -> Result[Unit, Error] {
+    let start = outer.position();
+    let length = read_length(outer)?;
+    let end = outer.position() + length;
+    let reader = Reader::new(sections.info, outer.position(), end, endian, ".debug_info")?;
+    let version = reader.read(2)?.to_u16();
+    if version < 2 || version > 5 {
+        return Result::Err(
+            failure(ErrorKind::Unsupported, ".debug_info", start, "unsupported DWARF version"),
+        )
+    }
+    let (unit_type, address_size, abbrev_offset) = if version == 5 {
+        let unit_type = reader.read(1)?.to_u8();
+        let address_size = reader.read(1)?.to_u8();
+        let abbrev_offset = reader.read(4)?.to_isize();
+        if unit_type != 1 && unit_type != 3 {
+            return Result::Err(
+                failure(ErrorKind::Unsupported, ".debug_info", start, "unsupported unit type"),
+            )
+        };
+        (unit_type, address_size, abbrev_offset)
+    } else {
+        let abbrev_offset = reader.read(4)?.to_isize();
+        let address_size = reader.read(1)?.to_u8();
+        (1, address_size, abbrev_offset)
+    };
+    if address_size != 1 && address_size != 2 && address_size != 4 && address_size != 8 {
+        return Result::Err(
+            failure(ErrorKind::Unsupported, ".debug_info", start, "unsupported address size"),
+        )
+    }
+    let table = match tables.get(abbrev_offset) {
+        Some(value) => value,
+        None => {
+            let value = abbrevs(sections, abbrev_offset, endian, limits, abbrev_count)?;
+            tables.insert(abbrev_offset, value);
+            value
+        },
+    };
+    let entries: Vec[Entry] = Vec::new();
+    let mut depth = 0;
+    while reader.remaining() > 0 {
+        let offset = reader.position();
+        let code = reader.uleb()?;
+        if code == 0 {
+            if depth == 0 {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, ".debug_info", offset, "unexpected end of children"),
+                )
+            }
+            depth -= 1;
+            continue
+        }
+        if entry_count.get() >= limits.max_entries {
+            return Result::Err(
+                failure(ErrorKind::Limit, ".debug_info", offset, "DIE limit exceeded"),
+            )
+        }
+        entry_count.set(entry_count.get() + 1);
+        let abbreviation = table.get(code).ok_or(
+            failure(ErrorKind::Invalid, ".debug_info", offset, "unknown abbreviation code"),
+        )?;
+        let attributes: Vec[Attribute] = Vec::new();
+        for spec in abbreviation.specs {
+            if attribute_count.get() >= limits.max_attributes {
+                return Result::Err(
+                    failure(ErrorKind::Limit, ".debug_info", offset, "attribute limit exceeded"),
+                )
+            }
+            attribute_count.set(attribute_count.get() + 1);
+            let (form, value) = form_value(
+                reader,
+                spec,
+                sections,
+                version,
+                address_size,
+                start,
+                end,
+                limits,
+                decoded,
+            )?;
+            attributes.push(Attribute { name: spec.name, form, value });
+        }
+        entries.push(
+            Entry {
+                offset,
+                depth,
+                tag: abbreviation.tag,
+                has_children: abbreviation.children,
+                attributes,
+            },
+        );
+        if abbreviation.children {
+            depth += 1;
+            if depth > limits.max_entries {
+                return Result::Err(
+                    failure(ErrorKind::Limit, ".debug_info", offset, "DIE depth limit exceeded"),
+                )
+            }
+        }
+    }
+    if depth != 0 || entries.len() == 0 {
+        return Result::Err(
+            failure(ErrorKind::Invalid, ".debug_info", end, "incomplete compilation unit"),
+        )
+    }
+    outer.pos.set(end);
+    Result::Ok(
+        Unit { offset: start, end, version, unit_type, address_size, abbrev_offset, entries },
+    )
+}
+
+pub fn parse_sections(sections: Sections, endian: Endian, limits: Limits) -> Result[Data, Error] {
+    validate_sections(sections, limits)?;
+    let outer = Reader::new(sections.info, 0, sections.info.len(), endian, ".debug_info")?;
+    let units: Vec[Unit] = Vec::new();
+    let tables: HashMap[isize, HashMap[u64, Abbrev]] = HashMap::new();
+    let abbrev_count = Ref::new(0);
+    let entry_count = Ref::new(0);
+    let attribute_count = Ref::new(0);
+    let decoded = Ref::new(0);
+    while outer.remaining() > 0 {
+        if units.len() >= limits.max_units {
+            return Result::Err(
+                failure(ErrorKind::Limit, ".debug_info", outer.position(), "unit limit exceeded"),
+            )
+        }
+        units.push(
+            parse_unit(
+                sections,
+                outer,
+                endian,
+                limits,
+                tables,
+                abbrev_count,
+                entry_count,
+                attribute_count,
+                decoded,
+            )?,
+        );
+    }
+    let line_tables: Vec[LineTable] = Vec::new();
+    let offsets: HashMap[isize, bool] = HashMap::new();
+    for unit in units {
+        for entry in unit.entries {
+            if entry.depth != 0 {
+                continue
+            }
+            let mut line_offset: isize = -1;
+            let mut comp_dir = "";
+            for attribute in entry.attributes {
+                if attribute.name == 0x10 {
+                    if let Value::Unsigned(value) = attribute.value {
+                        if value > sections.line.len().to_u64() {
+                            return Result::Err(
+                                failure(
+                                    ErrorKind::Invalid,
+                                    ".debug_line",
+                                    0,
+                                    "line offset outside section",
+                                ),
+                            )
+                        }
+                        line_offset = value.to_isize();
+                    }
+                } else if attribute.name == 0x1b {
+                    if let Value::Text(value) = attribute.value {
+                        comp_dir = value;
+                    }
+                }
+            }
+            if line_offset >= 0 && !offsets.contains(line_offset) {
+                offsets.insert(line_offset, true);
+                line_tables.push(
+                    parse_line_table(
+                        sections,
+                        line_offset,
+                        unit.address_size,
+                        comp_dir,
+                        endian,
+                        limits,
+                        decoded,
+                    )?,
+                );
+            }
+        }
+    }
+    Result::Ok(Data { units, line_tables })
+}

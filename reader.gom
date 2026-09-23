@@ -1,0 +1,184 @@
+package dwarf;
+
+use std::bytes;
+use std::utf8;
+
+struct Reader {
+    data: bytes::Bytes,
+    pos: Ref[isize],
+    end: isize,
+    endian: Endian,
+    section: string,
+}
+
+impl Reader {
+    fn new(data: bytes::Bytes, start: isize, end: isize, endian: Endian, section: string) -> Result[
+        Reader,
+        Error,
+    ] {
+        if start < 0 || end < start || end > data.len() {
+            return Result::Err(failure(ErrorKind::Invalid, section, start, "invalid reader range"))
+        }
+        Result::Ok(Reader { data, pos: Ref::new(start), end, endian, section })
+    }
+
+    fn position(self: Reader) -> isize {
+        self.pos.get()
+    }
+
+    fn remaining(self: Reader) -> isize {
+        self.end - self.pos.get()
+    }
+
+    fn read(self: Reader, width: isize) -> Result[u64, Error] {
+        let at = self.position();
+        if width < 0 || width > 8 || width > self.remaining() {
+            return Result::Err(failure(ErrorKind::Truncated, self.section, at, "truncated integer"))
+        }
+        let mut value: u64 = 0;
+        for index in 0..width {
+            let byte = self.data.get(at + index).to_u64();
+            if self.endian == Endian::Little {
+                value |= byte << (index * 8).to_u64();
+            } else {
+                value = (value << 8) | byte;
+            }
+        }
+        self.pos.set(at + width);
+        Result::Ok(value)
+    }
+
+    fn uleb(self: Reader) -> Result[u64, Error] {
+        let start = self.position();
+        let mut value: u64 = 0;
+        for index in 0..10 {
+            let byte = self.read(1)?;
+            if index == 9 && byte > 1 {
+                return Result::Err(
+                    failure(ErrorKind::Invalid, self.section, start, "ULEB128 overflow"),
+                )
+            }
+            value |= (byte & 127) << (index * 7).to_u64();
+            if byte < 128 {
+                return Result::Ok(value)
+            }
+        }
+        Result::Err(failure(ErrorKind::Invalid, self.section, start, "ULEB128 overflow"))
+    }
+
+    fn sleb(self: Reader) -> Result[i64, Error] {
+        let start = self.position();
+        let mut value: i64 = 0;
+        let mut shift = 0;
+        for index in 0..10 {
+            let byte = self.read(1)?;
+            if index == 9 {
+                if byte != 0 && byte != 127 {
+                    return Result::Err(
+                        failure(ErrorKind::Invalid, self.section, start, "SLEB128 overflow"),
+                    )
+                }
+                return Result::Ok(
+                    if byte == 127 {
+                        value | ((-1).to_i64() << 63)
+                    } else {
+                        value
+                    },
+                )
+            }
+            value |= ((byte & 127).to_i64()) << shift;
+            shift += 7;
+            if byte < 128 {
+                if byte & 64 != 0 {
+                    value |= (-1).to_i64() << shift;
+                }
+                return Result::Ok(value)
+            }
+        }
+        Result::Err(failure(ErrorKind::Invalid, self.section, start, "SLEB128 overflow"))
+    }
+
+    fn take(self: Reader, count: isize) -> Result[bytes::Bytes, Error] {
+        if count < 0 || count > self.remaining() {
+            return Result::Err(
+                failure(ErrorKind::Truncated, self.section, self.position(), "truncated bytes"),
+            )
+        }
+        let start = self.position();
+        self.pos.set(start + count);
+        Result::Ok(bytes::Bytes::from_slice_copy(self.data.as_slice().sub(start, start + count)))
+    }
+
+    fn cstring(self: Reader, max_bytes: isize, decoded: Ref[isize], max_decoded: isize) -> Result[
+        string,
+        Error,
+    ] {
+        let start = self.position();
+        let mut end = start;
+        while end < self.end && end - start <= max_bytes {
+            if self.data.get(end) == 0 {
+                charge_text(end - start, decoded, max_decoded, self.section, start)?;
+                self.pos.set(end + 1);
+                return utf8::decode_slice(self.data.as_slice().sub(start, end)).map_err(
+                    |_| failure(ErrorKind::Utf8, self.section, start, "invalid UTF-8 string"),
+                )
+            }
+            end += 1;
+        }
+        if end - start > max_bytes {
+            Result::Err(
+                failure(ErrorKind::Limit, self.section, start, "string byte limit exceeded"),
+            )
+        } else {
+            Result::Err(failure(ErrorKind::Truncated, self.section, start, "unterminated string"))
+        }
+    }
+}
+
+fn charge_text(amount: isize, decoded: Ref[isize], maximum: isize, section: string, offset: isize) -> Result[
+    (),
+    Error,
+] {
+    if amount < 0 || amount > maximum - decoded.get() {
+        return Result::Err(
+            failure(ErrorKind::Limit, section, offset, "decoded text byte limit exceeded"),
+        )
+    }
+    decoded.set(decoded.get() + amount);
+    Result::Ok(())
+}
+
+fn string_at(
+    data: bytes::Bytes,
+    offset: u64,
+    max_bytes: isize,
+    decoded: Ref[isize],
+    max_decoded: isize,
+    section: string,
+) -> Result[string, Error] {
+    if offset > data.len().to_u64() {
+        return Result::Err(failure(ErrorKind::Invalid, section, 0, "string offset outside section"))
+    }
+    Reader::new(data, offset.to_isize(), data.len(), Endian::Little, section)?.cstring(
+        max_bytes,
+        decoded,
+        max_decoded,
+    )
+}
+
+fn read_length(reader: Reader) -> Result[isize, Error] {
+    let start = reader.position();
+    let length = reader.read(4)?;
+    if length == 0xffffffff {
+        return Result::Err(failure(ErrorKind::Unsupported, reader.section, start, "DWARF64 unit"))
+    }
+    if length >= 0xfffffff0 {
+        return Result::Err(
+            failure(ErrorKind::Invalid, reader.section, start, "reserved unit length"),
+        )
+    }
+    if length > reader.remaining().to_u64() {
+        return Result::Err(failure(ErrorKind::Truncated, reader.section, start, "truncated unit"))
+    }
+    Result::Ok(length.to_isize())
+}

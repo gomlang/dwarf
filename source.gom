@@ -1,0 +1,101 @@
+package dwarf;
+
+use std::bytes;
+use std::io;
+use io::ReadAt;
+
+fn zeros(count: isize) -> bytes::Bytes {
+    let result = bytes::Bytes::with_capacity(count);
+    for _ in 0..count {
+        result.push(0);
+    }
+    result
+}
+
+fn check_span(span: Span, name: string, file_size: isize, limits: Limits) -> Result[(), Error] {
+    if span.offset < 0 || span.size < 0 || span.offset > file_size
+        || span.size > file_size - span.offset {
+        return Result::Err(
+            failure(ErrorKind::Invalid, name, span.offset, "section range outside source"),
+        )
+    }
+    if span.size > limits.max_section_bytes {
+        return Result::Err(
+            failure(ErrorKind::Limit, name, span.offset, "section byte limit exceeded"),
+        )
+    }
+    Result::Ok(())
+}
+
+fn read_span[R: ReadAt](source: R, span: Span, name: string) -> Result[bytes::Bytes, Error] {
+    let data: bytes::Bytes = zeros(span.size);
+    source.read_exact_at(data.as_mut_slice(), span.offset).map_err(
+        |error| failure(ErrorKind::Io, name, span.offset, error.to_string()),
+    )?;
+    Result::Ok(data)
+}
+
+pub fn load_at[R: ReadAt](source: R, spans: SectionSpans, file_size: isize, limits: Limits) -> Result[
+    Sections,
+    Error,
+] {
+    limits.validate()?;
+    if file_size < 0 {
+        return Result::Err(failure(ErrorKind::Invalid, "sections", 0, "negative source size"))
+    }
+    check_span(spans.info, ".debug_info", file_size, limits)?;
+    check_span(spans.abbrev, ".debug_abbrev", file_size, limits)?;
+    check_span(spans.line, ".debug_line", file_size, limits)?;
+    check_span(spans.strings, ".debug_str", file_size, limits)?;
+    check_span(spans.line_strings, ".debug_line_str", file_size, limits)?;
+    let sizes = Vec::from_array(
+        [
+            spans.info.size,
+            spans.abbrev.size,
+            spans.line.size,
+            spans.strings.size,
+            spans.line_strings.size,
+        ],
+    );
+    let mut total = 0;
+    for size in sizes {
+        if size > limits.max_total_bytes - total {
+            return Result::Err(
+                failure(ErrorKind::Limit, "sections", 0, "total byte limit exceeded"),
+            )
+        }
+        total += size;
+    }
+    Result::Ok(
+        Sections {
+            info: read_span(source, spans.info, ".debug_info")?,
+            abbrev: read_span(source, spans.abbrev, ".debug_abbrev")?,
+            line: read_span(source, spans.line, ".debug_line")?,
+            strings: read_span(source, spans.strings, ".debug_str")?,
+            line_strings: read_span(source, spans.line_strings, ".debug_line_str")?,
+        },
+    )
+}
+
+fn validate_sections(sections: Sections, limits: Limits) -> Result[(), Error] {
+    limits.validate()?;
+    let sizes = Vec::from_array(
+        [
+            sections.info.len(),
+            sections.abbrev.len(),
+            sections.line.len(),
+            sections.strings.len(),
+            sections.line_strings.len(),
+        ],
+    );
+    let mut total = 0;
+    for size in sizes {
+        if size > limits.max_section_bytes || size > limits.max_total_bytes - total {
+            return Result::Err(
+                failure(ErrorKind::Limit, "sections", 0, "section byte limit exceeded"),
+            )
+        }
+        total += size;
+    }
+    Result::Ok(())
+}
