@@ -1,0 +1,348 @@
+package tests;
+
+use ecosystem::dwarf;
+use dwarf::{Endian, ErrorKind, Limits, SectionSpans, Sections, Span, Value};
+use std::bytes;
+use std::fs;
+use std::io;
+use io::ReadAt;
+use std::testing;
+
+fn fixture(version: string) -> Sections {
+    Sections {
+        info: testing::expect_ok(
+            fs::read_bytes_structured("tests/data/v" + version + "-info.bin"),
+            "info",
+        ),
+        abbrev: testing::expect_ok(
+            fs::read_bytes_structured("tests/data/v" + version + "-abbrev.bin"),
+            "abbrev",
+        ),
+        line: testing::expect_ok(
+            fs::read_bytes_structured("tests/data/v" + version + "-line.bin"),
+            "line",
+        ),
+        strings: testing::expect_ok(
+            fs::read_bytes_structured("tests/data/v" + version + "-str.bin"),
+            "str",
+        ),
+        line_strings: testing::expect_ok(
+            fs::read_bytes_structured("tests/data/v" + version + "-line-str.bin"),
+            "line str",
+        ),
+    }
+}
+
+fn base_name(path: string) -> string {
+    let parts = path.split("/");
+    parts[parts.len() - 1]
+}
+
+#[test]
+fn go_126_debug_dwarf_reference() -> () {
+    let reference = testing::expect_ok(
+        fs::read_file_structured("tests/data/reference.tsv"),
+        "reference",
+    );
+    let mut cases = 0;
+    for row in reference.split("\n") {
+        if row == "" {
+            continue
+        }
+        let columns = row.split("\t");
+        testing::assert_eq(columns.len(), 5);
+        let data = testing::expect_ok(
+            dwarf::parse_sections(fixture(columns[0]), Endian::Little, Limits::standard()),
+            "DWARF",
+        );
+        testing::assert_eq(data.units.len(), 1);
+        testing::assert_eq(data.units[0].version.to_string(), columns[0]);
+        testing::assert_eq(data.units[0].entries.len().to_string(), columns[1]);
+        let names: Vec[string] = Vec::new();
+        for entry in data.units[0].entries {
+            for attribute in entry.attributes {
+                if attribute.name == 3 {
+                    if let Value::Text(value) = attribute.value {
+                        names.push(value);
+                    }
+                }
+            }
+        }
+        testing::assert_eq(names.join(","), columns[2]);
+        testing::assert_eq(data.line_tables.len(), 1);
+        let table = data.line_tables[0];
+        let files: Vec[string] = Vec::new();
+        for name in table.files {
+            if name != "" {
+                files.push(base_name(name));
+            }
+        }
+        testing::assert_eq(files.join(","), columns[3]);
+        let lines: Vec[string] = Vec::new();
+        for line in table.rows {
+            testing::assert(line.file >= 0 && line.file < table.files.len());
+            lines.push(
+                line.address.to_string() + ":" + base_name(table.files[line.file]) + ":"
+                    + line.line.to_string()
+                    + ":"
+                    + line.end_sequence.to_string(),
+            );
+        }
+        testing::assert_eq(lines.join(","), columns[4]);
+        cases += 1;
+    }
+    testing::assert_eq(cases, 3);
+}
+
+fn pack(sections: Sections) -> (bytes::Bytes, SectionSpans) {
+    let output = bytes::Bytes::new();
+    let info = Span { offset: output.len(), size: sections.info.len() };
+    output.extend_from_slice(sections.info.as_slice());
+    let abbrev = Span { offset: output.len(), size: sections.abbrev.len() };
+    output.extend_from_slice(sections.abbrev.as_slice());
+    let line = Span { offset: output.len(), size: sections.line.len() };
+    output.extend_from_slice(sections.line.as_slice());
+    let strings = Span { offset: output.len(), size: sections.strings.len() };
+    output.extend_from_slice(sections.strings.as_slice());
+    let line_strings = Span { offset: output.len(), size: sections.line_strings.len() };
+    output.extend_from_slice(sections.line_strings.as_slice());
+    (output, SectionSpans { info, abbrev, line, strings, line_strings })
+}
+
+struct ShortAt {}
+
+impl ReadAt for ShortAt {
+    fn read_at(self: ShortAt, _buffer: MutSlice[byte], _offset: isize) -> Result[
+        isize,
+        io::TransferError,
+    ] {
+        Result::Ok(0)
+    }
+}
+
+#[test]
+fn random_access_source_checks_ranges_limits_and_short_reads() -> () {
+    let (packed, spans) = pack(fixture("4"));
+    let loaded = testing::expect_ok(
+        dwarf::load_at(io::Cursor::new(packed), spans, packed.len(), Limits::standard()),
+        "load_at",
+    );
+    testing::assert_eq(loaded.info.len(), spans.info.size);
+    testing::assert_eq(
+        testing::expect_ok(
+            dwarf::parse_sections(loaded, Endian::Little, Limits::standard()),
+            "loaded parse",
+        ).units.len(),
+        1,
+    );
+    let error = testing::expect_err(
+        dwarf::load_at(ShortAt {}, spans, packed.len(), Limits::standard()),
+        "short read",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Io);
+    let mut bad = spans;
+    bad.info.offset = packed.len();
+    testing::assert_err(
+        dwarf::load_at(io::Cursor::new(packed), bad, packed.len(), Limits::standard()),
+    );
+    let mut limits = Limits::standard();
+    limits.max_total_bytes = 4;
+    testing::assert_err(dwarf::load_at(io::Cursor::new(packed), spans, packed.len(), limits));
+}
+
+#[test]
+fn malformed_units_abbrevs_and_line_tables_fail_recoverably() -> () {
+    let original = fixture("5");
+    let truncated = bytes::Bytes::from_slice_copy(original.info.as_slice().sub(0, 10));
+    let mut sections = fixture("5");
+    sections.info = truncated;
+    testing::assert_err(dwarf::parse_sections(sections, Endian::Little, Limits::standard()));
+    sections = fixture("5");
+    sections.info.set(4, 9);
+    let error = testing::expect_err(
+        dwarf::parse_sections(sections, Endian::Little, Limits::standard()),
+        "version",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Unsupported);
+    sections = fixture("5");
+    sections.abbrev.set(0, 0);
+    testing::assert_err(dwarf::parse_sections(sections, Endian::Little, Limits::standard()));
+    sections = fixture("5");
+    sections.abbrev.set(4, 0x1a);
+    testing::assert_eq(
+        testing::expect_err(
+            dwarf::parse_sections(sections, Endian::Little, Limits::standard()),
+            "unsupported form",
+        ).kind,
+        ErrorKind::Unsupported,
+    );
+    sections = fixture("5");
+    for index in 0..4 {
+        sections.info.set(index, 0xff);
+    }
+    testing::assert_eq(
+        testing::expect_err(
+            dwarf::parse_sections(sections, Endian::Little, Limits::standard()),
+            "DWARF64",
+        ).kind,
+        ErrorKind::Unsupported,
+    );
+    sections = fixture("5");
+    sections.line.set(0, 0xff);
+    testing::assert_err(dwarf::parse_sections(sections, Endian::Little, Limits::standard()));
+    let mut limits = Limits::standard();
+    limits.max_entries = 1;
+    testing::assert_err(dwarf::parse_sections(fixture("5"), Endian::Little, limits));
+}
+
+#[test]
+fn big_endian_header_and_implicit_signed_forms() -> () {
+    let mut sections = Sections::empty();
+    sections.info = bytes::Bytes::from_vec(
+        Vec::from_array([0, 0, 0, 10, 0, 4, 0, 0, 0, 0, 8, 1, 120, 0]),
+    );
+    sections.abbrev = bytes::Bytes::from_vec(Vec::from_array([1, 17, 0, 3, 8, 0, 0, 0]));
+    let parsed = testing::expect_ok(
+        dwarf::parse_sections(sections, Endian::Big, Limits::standard()),
+        "big endian",
+    );
+    testing::assert_eq(parsed.units[0].version, 4);
+    sections = Sections::empty();
+    sections.info = bytes::Bytes::from_vec(
+        Vec::from_array([15, 0, 0, 0, 5, 0, 1, 8, 0, 0, 0, 0, 1, 120, 0, 0x7d, 2, 0xaa, 0xbb]),
+    );
+    sections.abbrev = bytes::Bytes::from_vec(
+        Vec::from_array([1, 17, 0, 3, 8, 0x1c, 0x21, 0x7b, 2, 0x0d, 0x40, 0x18, 0, 0, 0]),
+    );
+    let parsed = testing::expect_ok(
+        dwarf::parse_sections(sections, Endian::Little, Limits::standard()),
+        "signed forms",
+    );
+    let attrs = parsed.units[0].entries[0].attributes;
+    testing::assert_eq(attrs.len(), 4);
+    match attrs[1].value {
+        Value::Signed(value) => testing::assert_eq(value, -5),
+        _ => testing::fail("implicit constant"),
+    }
+    match attrs[2].value {
+        Value::Signed(value) => testing::assert_eq(value, -3),
+        _ => testing::fail("signed data"),
+    }
+    match attrs[3].value {
+        Value::Bytes(data) => {
+            testing::assert_eq(data.len(), 2);
+            testing::assert_eq(data.get(0), 0xaa);
+        },
+        _ => testing::fail("expression bytes"),
+    }
+}
+
+#[test]
+fn repeated_string_references_charge_cumulative_text_budget() -> () {
+    let mut sections = Sections::empty();
+    sections.info = bytes::Bytes::from_vec(
+        Vec::from_array([16, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1, 0, 0, 0, 0, 0, 0, 0, 0]),
+    );
+    sections.abbrev = bytes::Bytes::from_vec(Vec::from_array([1, 17, 0, 3, 14, 27, 14, 0, 0, 0]));
+    sections.strings = bytes::Bytes::from_string("abcdefghij");
+    sections.strings.push(0);
+    let mut limits = Limits::standard();
+    limits.max_decoded_text_bytes = 15;
+    let error = testing::expect_err(
+        dwarf::parse_sections(sections, Endian::Little, limits),
+        "repeated strp",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Limit);
+    testing::assert_eq(error.section, ".debug_str");
+    limits.max_decoded_text_bytes = 20;
+    testing::assert_eq(
+        testing::expect_ok(dwarf::parse_sections(sections, Endian::Little, limits), "budget fits").units.len(),
+        1,
+    );
+    let parsed = testing::expect_ok(
+        dwarf::parse_sections(fixture("5"), Endian::Little, Limits::standard()),
+        "v5 baseline",
+    );
+    let mut info_text_bytes = 0;
+    for unit in parsed.units {
+        for entry in unit.entries {
+            for attribute in entry.attributes {
+                if let Value::Text(value) = attribute.value {
+                    info_text_bytes += value.byte_len();
+                }
+            }
+        }
+    }
+    limits = Limits::standard();
+    limits.max_decoded_text_bytes = info_text_bytes + 8 + 8 + 17;
+    let error = testing::expect_err(
+        dwarf::parse_sections(fixture("5"), Endian::Little, limits),
+        "repeated line_strp",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Limit);
+    testing::assert_eq(error.section, ".debug_line_str");
+}
+
+#[test]
+fn unit_relative_references_do_not_wrap_into_other_units() -> () {
+    let mut sections = Sections::empty();
+    sections.abbrev = bytes::Bytes::from_vec(
+        Vec::from_array([1, 17, 0, 0, 0, 0, 1, 17, 0, 0x49, 0x14, 0, 0, 0]),
+    );
+    sections.info = bytes::Bytes::from_vec(
+        Vec::from_array(
+            [
+                8,
+                0,
+                0,
+                0,
+                4,
+                0,
+                0,
+                0,
+                0,
+                0,
+                8,
+                1,
+                16,
+                0,
+                0,
+                0,
+                4,
+                0,
+                6,
+                0,
+                0,
+                0,
+                8,
+                1,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+            ],
+        ),
+    );
+    let error = testing::expect_err(
+        dwarf::parse_sections(sections, Endian::Little, Limits::standard()),
+        "wrapping ref8",
+    );
+    testing::assert_eq(error.kind, ErrorKind::Invalid);
+    testing::assert_eq(error.section, ".debug_info");
+}
+
+#[test]
+fn line_file_limit_counts_real_files_only() -> () {
+    let mut limits = Limits::standard();
+    limits.max_line_files = 1;
+    let parsed = testing::expect_ok(
+        dwarf::parse_sections(fixture("4"), Endian::Little, limits),
+        "one v4 file",
+    );
+    testing::assert_eq(parsed.line_tables[0].files.len(), 2);
+    testing::assert_err(dwarf::parse_sections(fixture("5"), Endian::Little, limits));
+}
