@@ -1,0 +1,55 @@
+package main;
+
+use ecosystem::dwarf;
+use dwarf::{Endian, Limits, SectionSpans, Sections, Span, Value};
+use std::bytes;
+use std::io;
+use std::testing;
+
+pub fn exercise() -> () {
+    let info = bytes::Bytes::from_vec(
+        Vec::from_array([10, 0, 0, 0, 4, 0, 0, 0, 0, 0, 8, 1, 120, 0]),
+    );
+    let abbrev = bytes::Bytes::from_vec(Vec::from_array([1, 17, 0, 3, 8, 0, 0, 0]));
+    let sections = Sections {
+        info,
+        abbrev,
+        line: bytes::Bytes::new(),
+        strings: bytes::Bytes::new(),
+        line_strings: bytes::Bytes::new(),
+    };
+    let parsed = testing::expect_ok(
+        dwarf::parse_sections(sections, Endian::Little, Limits::standard()),
+        "parse",
+    );
+    testing::assert_eq(parsed.units.len(), 1);
+    testing::assert_eq(parsed.units[0].version, 4);
+    match parsed.units[0].entries[0].attributes[0].value {
+        Value::Text(name) => testing::assert_eq(name, "x"),
+        _ => testing::fail("unit name"),
+    }
+    let source = bytes::Bytes::new();
+    source.extend_from_slice(info.as_slice());
+    source.extend_from_slice(abbrev.as_slice());
+    let empty = Span { offset: 0, size: 0 };
+    let spans = SectionSpans {
+        info: Span { offset: 0, size: info.len() },
+        abbrev: Span { offset: info.len(), size: abbrev.len() },
+        line: empty,
+        strings: empty,
+        line_strings: empty,
+    };
+    let loaded = testing::expect_ok(
+        dwarf::load_at(io::Cursor::new(source), spans, source.len(), Limits::standard()),
+        "ReadAt",
+    );
+    testing::assert_eq(loaded.info.len(), info.len());
+    let mut limits = Limits::standard();
+    limits.max_units = 0;
+    testing::assert_err(dwarf::parse_sections(loaded, Endian::Little, limits));
+}
+
+fn main() -> () {
+    exercise();
+    println("dwarf consumer: ok");
+}
