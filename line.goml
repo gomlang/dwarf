@@ -1,5 +1,24 @@
 package dwarf;
 
+struct LineCounts {
+    files: Ref[isize],
+    directories: Ref[isize],
+    rows: Ref[isize],
+}
+
+fn charge_line_item(count: Ref[isize], maximum: isize, offset: isize, kind: string) -> Result[
+    (),
+    Error,
+] {
+    if count.get() >= maximum {
+        return Result::Err(
+            failure(ErrorKind::Limit, ".debug_line", offset, kind + " limit exceeded"),
+        )
+    }
+    count.set(count.get() + 1);
+    Result::Ok(())
+}
+
 struct LineField {
     content: u64,
     form: u64,
@@ -160,19 +179,9 @@ fn append_file(
     limits: Limits,
     offset: isize,
     decoded: Ref[isize],
-    sentinel: bool,
+    counts: LineCounts,
 ) -> Result[(), Error] {
-    let real_files = files.len()
-        - if sentinel {
-            1
-        } else {
-            0
-        };
-    if real_files >= limits.max_line_files {
-        return Result::Err(
-            failure(ErrorKind::Limit, ".debug_line", offset, "line file limit exceeded"),
-        )
-    }
+    charge_line_item(counts.files, limits.max_line_files, offset, "line file")?;
     if name.starts_with("/") {
         files.push(name);
         return Result::Ok(())
@@ -224,15 +233,14 @@ fn change_line(current: i64, change: i64, offset: isize) -> Result[i64, Error] {
     Result::Ok(result)
 }
 
-fn emit_row(rows: Vec[DetailedLineRow], row: DetailedLineRow, limits: Limits, offset: isize) -> Result[
-    (),
-    Error,
-] {
-    if rows.len() >= limits.max_line_rows {
-        return Result::Err(
-            failure(ErrorKind::Limit, ".debug_line", offset, "line row limit exceeded"),
-        )
-    }
+fn emit_row(
+    rows: Vec[DetailedLineRow],
+    row: DetailedLineRow,
+    limits: Limits,
+    offset: isize,
+    counts: LineCounts,
+) -> Result[(), Error] {
+    charge_line_item(counts.rows, limits.max_line_rows, offset, "line row")?;
     rows.push(row);
     Result::Ok(())
 }
@@ -245,6 +253,7 @@ fn parse_line_table(
     endian: Endian,
     limits: Limits,
     decoded: Ref[isize],
+    counts: LineCounts,
 ) -> Result[DetailedLineTable, Error] {
     let outer = Reader::new(sections.line, offset, sections.line.len(), endian, ".debug_line")?;
     let length = read_length(outer)?;
@@ -315,16 +324,12 @@ fn parse_line_table(
             if name == "" {
                 break
             }
-            if directories.len() >= limits.max_line_files {
-                return Result::Err(
-                    failure(
-                        ErrorKind::Limit,
-                        ".debug_line",
-                        reader.position(),
-                        "line directory limit exceeded",
-                    ),
-                )
-            }
+            charge_line_item(
+                counts.directories,
+                limits.max_line_files,
+                reader.position(),
+                "line directory",
+            )?;
             directories.push(combine_path(comp_dir, name, decoded, limits, reader.position())?);
         }
         loop {
@@ -347,13 +352,13 @@ fn parse_line_table(
                 limits,
                 reader.position(),
                 decoded,
-                true,
+                counts,
             )?;
         }
     } else {
         let dir_fields = line_formats(reader)?;
         let dir_count = reader.uleb()?;
-        if dir_count > limits.max_line_files.to_u64() {
+        if dir_count > (limits.max_line_files - counts.directories.get()).to_u64() {
             return Result::Err(
                 failure(
                     ErrorKind::Limit,
@@ -364,12 +369,18 @@ fn parse_line_table(
             )
         }
         for _ in 0..dir_count.to_isize() {
+            charge_line_item(
+                counts.directories,
+                limits.max_line_files,
+                reader.position(),
+                "line directory",
+            )?;
             let (path, _) = line_path(reader, dir_fields, sections, limits, decoded)?;
             directories.push(combine_path(comp_dir, path, decoded, limits, reader.position())?);
         }
         let file_fields = line_formats(reader)?;
         let file_count = reader.uleb()?;
-        if file_count > limits.max_line_files.to_u64() {
+        if file_count > (limits.max_line_files - counts.files.get()).to_u64() {
             return Result::Err(
                 failure(
                     ErrorKind::Limit,
@@ -389,7 +400,7 @@ fn parse_line_table(
                 limits,
                 reader.position(),
                 decoded,
-                false,
+                counts,
             )?;
         }
     }
@@ -445,7 +456,7 @@ fn parse_line_table(
                 let directory = reader.uleb()?;
                 reader.uleb()?;
                 reader.uleb()?;
-                append_file(files, directories, name, directory, limits, at, decoded, true)?;
+                append_file(files, directories, name, directory, limits, at, decoded, counts)?;
             } else if operation == 3 {
                 return Result::Err(
                     failure(ErrorKind::Unsupported, ".debug_line", at, "DWARF5 define_file opcode"),
@@ -573,6 +584,7 @@ fn parse_line_table(
                 },
                 limits,
                 at,
+                counts,
             )?;
             basic_block = false;
             prologue_end = false;

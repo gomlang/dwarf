@@ -409,6 +409,7 @@ pub fn parse_sections_detailed(sections: Sections, endian: Endian, limits: Limit
         );
     }
     let line_tables: Vec[DetailedLineTable] = Vec::new();
+    let line_counts = LineCounts { files: Ref::new(0), directories: Ref::new(0), rows: Ref::new(0) };
     let offsets: HashMap[isize, bool] = HashMap::new();
     for unit in units {
         for entry in unit.entries {
@@ -449,6 +450,7 @@ pub fn parse_sections_detailed(sections: Sections, endian: Endian, limits: Limit
                         endian,
                         limits,
                         decoded,
+                        line_counts,
                     )?,
                 );
             }

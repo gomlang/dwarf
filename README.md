@@ -21,6 +21,15 @@ files/rows. Every materialized string is charged, including repeated `strp` or
 checked before decoding or joining. Errors include the
 section and byte offset; malformed data returns an error instead of terminating.
 
+`max_line_rows` bounds rows across the entire parse, and `max_line_files`
+bounds both total real file entries and total explicitly encoded directories
+(separate counters) across all parsed line tables. DWARF2–4's implicit directory
+and empty file sentinel are excluded. Runtime `define_file` entries are included.
+Repeated `DW_AT_stmt_list` references to one table share its already parsed
+result and consume these budgets once. Both parsing APIs enforce the same totals.
+This closes the previous per-table limit reset: inputs with many distinct tables
+may now return `Limit` when their combined output exceeds the selected limits.
+
 This is a defined subset of the [DWARF 5 specification](https://dwarfstd.org/doc/DWARF5.pdf).
 `parse_sections_detailed(sections, endian, limits)` returns `DetailedData` with
 the same units and `DetailedLineTable` values. Each `DetailedLineRow` contains
