@@ -96,7 +96,11 @@ fn line_sections(version: isize) -> Sections {
 fn line_rows_preserve_operation_positions_and_register_lifetimes() -> () {
     for version in Vec::from_array([4, 5]) {
         let data = testing::expect_ok(
-            dwarf::parse_sections(line_sections(version), Endian::Little, Limits::standard()),
+            dwarf::parse_sections_detailed(
+                line_sections(version),
+                Endian::Little,
+                Limits::standard(),
+            ),
             "line state",
         );
         let rows = data.line_tables[0].rows;
@@ -112,20 +116,79 @@ fn line_rows_preserve_operation_positions_and_register_lifetimes() -> () {
             testing::assert(!row.basic_block && !row.prologue_end && !row.epilogue_begin);
             testing::assert_eq(row.discriminator, 0);
         }
-        testing::assert_eq(rows[0].address, 0);
+        testing::assert_eq(rows[0].row.address, 0);
         testing::assert_eq(rows[0].op_index, 1);
         testing::assert_eq(rows[2].op_index, 2);
-        testing::assert_eq(rows[3].address, 2);
+        testing::assert_eq(rows[3].row.address, 2);
         testing::assert_eq(rows[3].op_index, 0);
         testing::assert_eq(rows[3].isa, 7);
-        testing::assert(rows[4].end_sequence && rows[4].basic_block);
+        testing::assert(rows[4].row.end_sequence && rows[4].basic_block);
         testing::assert_eq(rows[4].discriminator, 3);
         testing::assert_eq(rows[4].isa, 7);
-        testing::assert_eq(rows[5].address, 0);
+        testing::assert_eq(rows[5].row.address, 0);
         testing::assert_eq(rows[5].op_index, 0);
         testing::assert_eq(rows[5].isa, 0);
-        testing::assert_eq(rows[6].address, 5);
+        testing::assert_eq(rows[6].row.address, 5);
         testing::assert_eq(rows[6].op_index, 0);
-        testing::assert(rows[7].end_sequence);
+        testing::assert(rows[7].row.end_sequence);
+    }
+}
+
+#[test]
+fn original_line_records_and_parse_entry_point_remain_compatible() -> () {
+    let original = dwarf::LineRow {
+        address: 0,
+        file: 1,
+        line: 1,
+        column: 0,
+        is_stmt: true,
+        end_sequence: false,
+    };
+    let table = dwarf::LineTable {
+        offset: 0,
+        version: 4,
+        files: Vec::from_array(["", "a"]),
+        rows: Vec::from_array([original]),
+    };
+    let data = dwarf::Data { units: Vec::new(), line_tables: Vec::from_array([table]) };
+    testing::assert(data.line_tables[0].rows[0] == original);
+    for version in Vec::from_array([4, 5]) {
+        let sections = line_sections(version);
+        let legacy = testing::expect_ok(
+            dwarf::parse_sections(sections, Endian::Little, Limits::standard()),
+            "original API",
+        );
+        let detailed = testing::expect_ok(
+            dwarf::parse_sections_detailed(sections, Endian::Little, Limits::standard()),
+            "detailed API",
+        );
+        testing::assert_eq(legacy.units.len(), detailed.units.len());
+        testing::assert_eq(legacy.line_tables.len(), detailed.line_tables.len());
+        testing::assert(legacy.line_tables[0].rows[0] == original);
+        for index in 0..legacy.line_tables.len() {
+            let left = legacy.line_tables[index];
+            let right = detailed.line_tables[index];
+            testing::assert_eq(left.offset, right.offset);
+            testing::assert_eq(left.version, right.version);
+            testing::assert_eq(left.files.len(), right.files.len());
+            for file in 0..left.files.len() {
+                testing::assert_eq(left.files[file], right.files[file]);
+            }
+            testing::assert_eq(left.rows.len(), right.rows.len());
+            for row in 0..left.rows.len() {
+                testing::assert(left.rows[row] == right.rows[row].row);
+            }
+        }
+        let mut limits = Limits::standard();
+        limits.max_line_rows = 1;
+        let legacy_error = testing::expect_err(
+            dwarf::parse_sections(sections, Endian::Little, limits),
+            "original limit",
+        );
+        let detailed_error = testing::expect_err(
+            dwarf::parse_sections_detailed(sections, Endian::Little, limits),
+            "detailed limit",
+        );
+        testing::assert_eq(legacy_error, detailed_error);
     }
 }
