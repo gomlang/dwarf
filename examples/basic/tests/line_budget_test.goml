@@ -90,3 +90,59 @@ fn repeated_table_references_are_charged_once() -> () {
         testing::assert_eq(detailed.line_tables.len(), 1);
     }
 }
+
+fn budget_line_table(directory_count: isize, runtime_file: bool) -> Sections {
+    let mut sections = line_sections(4);
+    let header = std::bytes::Bytes::from_vec(
+        Vec::from_array([1, 1, 1, 0, 1, 13, 0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1]),
+    );
+    for _ in 0..directory_count {
+        header.push(b'd');
+        header.push(0);
+    }
+    header.extend_from_slice(
+        std::bytes::Bytes::from_vec(Vec::from_array([0, b'a', 0, 0, 0, 0, 0])).as_slice(),
+    );
+    let body = std::bytes::Bytes::new();
+    little(body, 4, 2);
+    little(body, header.len(), 4);
+    body.extend_from_slice(header.as_slice());
+    if runtime_file {
+        body.extend_from_slice(
+            std::bytes::Bytes::from_vec(Vec::from_array([0, 6, 3, b'b', 0, 0, 0, 0])).as_slice(),
+        );
+    }
+    body.extend_from_slice(std::bytes::Bytes::from_vec(Vec::from_array([0, 1, 1])).as_slice());
+    sections.line = std::bytes::Bytes::new();
+    little(sections.line, body.len(), 4);
+    sections.line.extend_from_slice(body.as_slice());
+    sections
+}
+
+fn join_budget_tables(first: Sections, second: Sections) -> Sections {
+    for index in 0..4 {
+        second.info.set(12 + index, (first.line.len() >> (index * 8)).to_u8());
+    }
+    first.info.extend_from_slice(second.info.as_slice());
+    first.line.extend_from_slice(second.line.as_slice());
+    first
+}
+
+#[test]
+fn explicit_directories_and_runtime_file_definitions_share_parse_wide_budgets() -> () {
+    let sections = join_budget_tables(budget_line_table(2, false), budget_line_table(2, false));
+    let limits = Limits { max_line_files: 3, ..Limits::standard() };
+    expect_budget(sections, limits, "line directory limit exceeded");
+    testing::assert_ok(
+        dwarf::parse_sections(sections, Endian::Little, Limits { max_line_files: 4, ..limits }),
+    );
+    let sections = join_budget_tables(budget_line_table(0, false), budget_line_table(0, true));
+    expect_budget(sections, Limits { max_line_files: 2, ..limits }, "line file limit exceeded");
+    let result = testing::expect_ok(
+        dwarf::parse_sections_detailed(sections, Endian::Little, limits),
+        "runtime file exact total",
+    );
+    testing::assert_eq(result.line_tables[0].files.len(), 2);
+    testing::assert_eq(result.line_tables[1].files.len(), 3);
+    testing::assert(result.line_tables[1].files[2].ends_with("b"));
+}
