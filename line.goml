@@ -224,23 +224,13 @@ fn change_line(current: i64, change: i64, offset: isize) -> Result[i64, Error] {
     Result::Ok(result)
 }
 
-fn emit_row(
-    rows: Vec[LineRow],
-    address: u64,
-    file: isize,
-    line: i64,
-    column: u64,
-    is_stmt: bool,
-    end_sequence: bool,
-    limits: Limits,
-    offset: isize,
-) -> Result[(), Error] {
+fn emit_row(rows: Vec[LineRow], row: LineRow, limits: Limits, offset: isize) -> Result[(), Error] {
     if rows.len() >= limits.max_line_rows {
         return Result::Err(
             failure(ErrorKind::Limit, ".debug_line", offset, "line row limit exceeded"),
         )
     }
-    rows.push(LineRow { address, file, line, column, is_stmt, end_sequence });
+    rows.push(row);
     Result::Ok(())
 }
 
@@ -418,6 +408,11 @@ fn parse_line_table(
     let mut line: i64 = 1;
     let mut column: u64 = 0;
     let mut is_stmt = default_is_stmt;
+    let mut basic_block = false;
+    let mut prologue_end = false;
+    let mut epilogue_begin = false;
+    let mut isa: u64 = 0;
+    let mut discriminator: u64 = 0;
     while reader.remaining() > 0 {
         let at = reader.position();
         let opcode = reader.read(1)?;
@@ -453,7 +448,7 @@ fn parse_line_table(
                     failure(ErrorKind::Unsupported, ".debug_line", at, "DWARF5 define_file opcode"),
                 )
             } else if operation == 4 {
-                reader.uleb()?;
+                discriminator = reader.uleb()?;
             }
             if reader.position() > extended_end {
                 return Result::Err(
@@ -515,7 +510,15 @@ fn parse_line_table(
                 6 => {
                     is_stmt = !is_stmt;
                 },
-                7 | 10 | 11 => (),
+                7 => {
+                    basic_block = true;
+                },
+                10 => {
+                    prologue_end = true;
+                },
+                11 => {
+                    epilogue_begin = true;
+                },
                 8 => {
                     let (next_address, next_index) = advance_address(
                         address,
@@ -539,7 +542,7 @@ fn parse_line_table(
                     op_index = 0;
                 },
                 12 => {
-                    reader.uleb()?;
+                    isa = reader.uleb()?;
                 },
                 _ => {
                     for _ in 0..opcode_lengths[opcode.to_isize()].to_isize() {
@@ -554,7 +557,29 @@ fn parse_line_table(
                     failure(ErrorKind::Invalid, ".debug_line", at, "line file index outside table"),
                 )
             }
-            emit_row(rows, address, file, line, column, is_stmt, end_sequence, limits, at)?;
+            emit_row(
+                rows,
+                LineRow {
+                    address,
+                    op_index,
+                    file,
+                    line,
+                    column,
+                    is_stmt,
+                    end_sequence,
+                    basic_block,
+                    prologue_end,
+                    epilogue_begin,
+                    isa,
+                    discriminator,
+                },
+                limits,
+                at,
+            )?;
+            basic_block = false;
+            prologue_end = false;
+            epilogue_begin = false;
+            discriminator = 0;
             if end_sequence {
                 address = 0;
                 op_index = 0;
@@ -562,6 +587,7 @@ fn parse_line_table(
                 line = 1;
                 column = 0;
                 is_stmt = default_is_stmt;
+                isa = 0;
             }
         }
     }

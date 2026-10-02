@@ -22,6 +22,15 @@ checked before decoding or joining. Errors include the
 section and byte offset; malformed data returns an error instead of terminating.
 
 This is a defined subset of the [DWARF 5 specification](https://dwarfstd.org/doc/DWARF5.pdf).
+`LineRow` preserves the complete line-machine position: `address` and `op_index`,
+file/line/column, `is_stmt`, `end_sequence`, `basic_block`, `prologue_end`,
+`epilogue_begin`, `isa`, and `discriminator`. Operation indexes distinguish
+multiple operations at one instruction address. Discriminators distinguish
+blocks sharing a source position. Transient flags and the discriminator reset
+after each row; ISA persists until the sequence ends. Consumers constructing
+`LineRow` records directly must supply the additional fields (zero/false for
+the initial state).
+
 DWARF64, type/skeleton/split units, supplementary objects, indexed
 `strx`/`addrx`/`loclistx`/`rnglistx` forms, `.debug_str_offsets`, `.debug_addr`,
 range/location list evaluation, CFI, macro tables, accelerator tables,

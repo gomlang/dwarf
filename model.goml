@@ -153,11 +153,17 @@ pub struct Unit {
 #[derive(PartialEq, Eq)]
 pub struct LineRow {
     pub address: u64,
+    pub op_index: u64,
     pub file: isize,
     pub line: i64,
     pub column: u64,
     pub is_stmt: bool,
     pub end_sequence: bool,
+    pub basic_block: bool,
+    pub prologue_end: bool,
+    pub epilogue_begin: bool,
+    pub isa: u64,
+    pub discriminator: u64,
 }
 
 pub struct LineTable {
