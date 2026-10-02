@@ -1,6 +1,6 @@
 package tests;
 
-use consumer::dwarf as app;
+use ecosystem::dwarf::examples::basic as app;
 
 #[test]
 fn versioned_dwarf_api() -> () {

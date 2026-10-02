@@ -1,5 +1,0 @@
-[module]
-path = "consumer::dwarf"
-
-[dependencies]
-"ecosystem::dwarf" = "0.1.0"
