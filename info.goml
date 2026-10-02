@@ -362,6 +362,24 @@ fn parse_unit(
 }
 
 pub fn parse_sections(sections: Sections, endian: Endian, limits: Limits) -> Result[Data, Error] {
+    let detailed = parse_sections_detailed(sections, endian, limits)?;
+    let line_tables: Vec[LineTable] = Vec::with_capacity(detailed.line_tables.len());
+    for table in detailed.line_tables {
+        let rows: Vec[LineRow] = Vec::with_capacity(table.rows.len());
+        for row in table.rows {
+            rows.push(row.row);
+        }
+        line_tables.push(
+            LineTable { offset: table.offset, version: table.version, files: table.files, rows },
+        );
+    }
+    Result::Ok(Data { units: detailed.units, line_tables })
+}
+
+pub fn parse_sections_detailed(sections: Sections, endian: Endian, limits: Limits) -> Result[
+    DetailedData,
+    Error,
+] {
     validate_sections(sections, limits)?;
     let outer = Reader::new(sections.info, 0, sections.info.len(), endian, ".debug_info")?;
     let units: Vec[Unit] = Vec::new();
@@ -390,7 +408,7 @@ pub fn parse_sections(sections: Sections, endian: Endian, limits: Limits) -> Res
             )?,
         );
     }
-    let line_tables: Vec[LineTable] = Vec::new();
+    let line_tables: Vec[DetailedLineTable] = Vec::new();
     let offsets: HashMap[isize, bool] = HashMap::new();
     for unit in units {
         for entry in unit.entries {
@@ -436,5 +454,5 @@ pub fn parse_sections(sections: Sections, endian: Endian, limits: Limits) -> Res
             }
         }
     }
-    Result::Ok(Data { units, line_tables })
+    Result::Ok(DetailedData { units, line_tables })
 }

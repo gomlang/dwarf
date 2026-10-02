@@ -224,7 +224,10 @@ fn change_line(current: i64, change: i64, offset: isize) -> Result[i64, Error] {
     Result::Ok(result)
 }
 
-fn emit_row(rows: Vec[LineRow], row: LineRow, limits: Limits, offset: isize) -> Result[(), Error] {
+fn emit_row(rows: Vec[DetailedLineRow], row: DetailedLineRow, limits: Limits, offset: isize) -> Result[
+    (),
+    Error,
+] {
     if rows.len() >= limits.max_line_rows {
         return Result::Err(
             failure(ErrorKind::Limit, ".debug_line", offset, "line row limit exceeded"),
@@ -242,7 +245,7 @@ fn parse_line_table(
     endian: Endian,
     limits: Limits,
     decoded: Ref[isize],
-) -> Result[LineTable, Error] {
+) -> Result[DetailedLineTable, Error] {
     let outer = Reader::new(sections.line, offset, sections.line.len(), endian, ".debug_line")?;
     let length = read_length(outer)?;
     let end = outer.position() + length;
@@ -401,7 +404,7 @@ fn parse_line_table(
         )
     }
     reader.pos.set(header_end);
-    let rows: Vec[LineRow] = Vec::new();
+    let rows: Vec[DetailedLineRow] = Vec::new();
     let mut address: u64 = 0;
     let mut op_index: u64 = 0;
     let mut file: isize = 1;
@@ -559,14 +562,9 @@ fn parse_line_table(
             }
             emit_row(
                 rows,
-                LineRow {
-                    address,
+                DetailedLineRow {
+                    row: LineRow { address, file, line, column, is_stmt, end_sequence },
                     op_index,
-                    file,
-                    line,
-                    column,
-                    is_stmt,
-                    end_sequence,
                     basic_block,
                     prologue_end,
                     epilogue_begin,
@@ -591,5 +589,5 @@ fn parse_line_table(
             }
         }
     }
-    Result::Ok(LineTable { offset, version, files, rows })
+    Result::Ok(DetailedLineTable { offset, version, files, rows })
 }

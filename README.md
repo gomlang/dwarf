@@ -22,14 +22,17 @@ checked before decoding or joining. Errors include the
 section and byte offset; malformed data returns an error instead of terminating.
 
 This is a defined subset of the [DWARF 5 specification](https://dwarfstd.org/doc/DWARF5.pdf).
-`LineRow` preserves the complete line-machine position: `address` and `op_index`,
-file/line/column, `is_stmt`, `end_sequence`, `basic_block`, `prologue_end`,
-`epilogue_begin`, `isa`, and `discriminator`. Operation indexes distinguish
+`parse_sections_detailed(sections, endian, limits)` returns `DetailedData` with
+the same units and `DetailedLineTable` values. Each `DetailedLineRow` contains
+the original six-field `LineRow` in `row`, plus `op_index`, `basic_block`,
+`prologue_end`, `epilogue_begin`, `isa`, and `discriminator`. The position is
+`detail.row.address` together with `detail.op_index`; operation indexes distinguish
 multiple operations at one instruction address. Discriminators distinguish
 blocks sharing a source position. Transient flags and the discriminator reset
-after each row; ISA persists until the sequence ends. Consumers constructing
-`LineRow` records directly must supply the additional fields (zero/false for
-the initial state).
+after each row; ISA persists until the sequence ends. Both parse entry points
+share the same state machine, limits and error handling. `load_at` produces
+`Sections` accepted by either entry point. Existing `parse_sections`, `LineRow`,
+`LineTable` and `Data` retain their original shapes and behavior.
 
 DWARF64, type/skeleton/split units, supplementary objects, indexed
 `strx`/`addrx`/`loclistx`/`rnglistx` forms, `.debug_str_offsets`, `.debug_addr`,
