@@ -1,0 +1,92 @@
+package tests;
+
+use ecosystem::dwarf;
+use dwarf::{Sections, Limits, Endian, ErrorKind};
+use std::testing;
+
+fn two_line_units(version: isize, shared: bool) -> Sections {
+    let sections = line_sections(version);
+    let second_offset = if shared {
+        0
+    } else {
+        sections.line.len()
+    };
+    let info = sections.info.copy();
+    for index in 0..4 {
+        info.set(12 + index, (second_offset >> (index * 8)).to_u8());
+    }
+    sections.info.extend_from_slice(info.as_slice());
+    if !shared {
+        sections.line.extend_from_slice(sections.line.copy().as_slice());
+    }
+    sections
+}
+
+fn expect_budget(sections: Sections, limits: Limits, message: string) -> () {
+    let original = testing::expect_err(
+        dwarf::parse_sections(sections, Endian::Little, limits),
+        "original budget",
+    );
+    let detailed = testing::expect_err(
+        dwarf::parse_sections_detailed(sections, Endian::Little, limits),
+        "detailed budget",
+    );
+    testing::assert_eq(original, detailed);
+    testing::assert_eq(original.kind, ErrorKind::Limit);
+    testing::assert_eq(original.message, message);
+}
+
+#[test]
+fn line_output_budgets_cover_all_distinct_tables() -> () {
+    for version in Vec::from_array([4, 5]) {
+        let sections = two_line_units(version, false);
+        let mut limits = Limits::standard();
+        limits.max_line_rows = 15;
+        expect_budget(sections, limits, "line row limit exceeded");
+        limits.max_line_rows = 16;
+        let parsed = testing::expect_ok(
+            dwarf::parse_sections_detailed(sections, Endian::Little, limits),
+            "exact total rows",
+        );
+        testing::assert_eq(parsed.units.len(), 2);
+        testing::assert_eq(parsed.line_tables.len(), 2);
+        testing::assert_eq(parsed.line_tables[0].rows.len() + parsed.line_tables[1].rows.len(), 16);
+        limits.max_line_files = if version == 4 {
+            1
+        } else {
+            3
+        };
+        expect_budget(sections, limits, "line file limit exceeded");
+        limits.max_line_files = if version == 4 {
+            2
+        } else {
+            4
+        };
+        testing::assert_ok(dwarf::parse_sections(sections, Endian::Little, limits));
+    }
+}
+
+#[test]
+fn repeated_table_references_are_charged_once() -> () {
+    for version in Vec::from_array([4, 5]) {
+        let mut limits = Limits::standard();
+        limits.max_line_rows = 8;
+        limits.max_line_files = if version == 4 {
+            1
+        } else {
+            2
+        };
+        let sections = two_line_units(version, true);
+        let original = testing::expect_ok(
+            dwarf::parse_sections(sections, Endian::Little, limits),
+            "shared original",
+        );
+        let detailed = testing::expect_ok(
+            dwarf::parse_sections_detailed(sections, Endian::Little, limits),
+            "shared detailed",
+        );
+        testing::assert_eq(original.units.len(), 2);
+        testing::assert_eq(original.line_tables.len(), 1);
+        testing::assert_eq(detailed.line_tables.len(), 1);
+    }
+}
