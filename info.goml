@@ -302,6 +302,16 @@ fn parse_unit(
             depth -= 1;
             continue
         }
+        if depth == 0 && entries.len() > 0 {
+            return Result::Err(
+                failure(
+                    ErrorKind::Invalid,
+                    ".debug_info",
+                    offset,
+                    "multiple compilation unit roots",
+                ),
+            )
+        }
         if entry_count.get() >= limits.max_entries {
             return Result::Err(
                 failure(ErrorKind::Limit, ".debug_info", offset, "DIE limit exceeded"),
@@ -311,6 +321,35 @@ fn parse_unit(
         let abbreviation = table.get(code).ok_or(
             failure(ErrorKind::Invalid, ".debug_info", offset, "unknown abbreviation code"),
         )?;
+        let unit_tag = abbreviation.tag == 0x11 || abbreviation.tag == 0x3c;
+        if depth == 0 {
+            if !unit_tag {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Invalid,
+                        ".debug_info",
+                        offset,
+                        "invalid compilation unit root tag",
+                    ),
+                )
+            }
+            if version == 5
+                && ((unit_type == 1 && abbreviation.tag != 0x11)
+                    || (unit_type == 3 && abbreviation.tag != 0x3c)) {
+                return Result::Err(
+                    failure(
+                        ErrorKind::Invalid,
+                        ".debug_info",
+                        offset,
+                        "unit header and root tag disagree",
+                    ),
+                )
+            }
+        } else if unit_tag {
+            return Result::Err(
+                failure(ErrorKind::Invalid, ".debug_info", offset, "nested compilation unit root"),
+            )
+        }
         let attributes: Vec[Attribute] = Vec::new();
         for spec in abbreviation.specs {
             if attribute_count.get() >= limits.max_attributes {

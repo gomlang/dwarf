@@ -21,6 +21,13 @@ files/rows. Every materialized string is charged, including repeated `strp` or
 checked before decoding or joining. Errors include the
 section and byte offset; malformed data returns an error instead of terminating.
 
+Each compilation unit must contain one root DIE tagged `DW_TAG_compile_unit`
+or `DW_TAG_partial_unit`, with all other DIEs in its child tree. Additional
+roots, nested unit roots, and DWARF5 root tags inconsistent with the unit header
+return `Invalid` at the offending DIE offset. Separate compilation units remain
+valid in one `.debug_info` section. This follows the
+[DWARF unit structure](https://dwarfstd.org/faq.html) and DWARF5 section 7.5.1.
+
 `max_line_rows` bounds rows across the entire parse, and `max_line_files`
 bounds both total real file entries and total explicitly encoded directories
 (separate counters) across all parsed line tables. DWARF2–4's implicit directory

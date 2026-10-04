@@ -1,0 +1,185 @@
+package tests;
+
+use ecosystem::dwarf;
+use dwarf::{Sections, Endian, Limits, ErrorKind};
+use std::bytes;
+use std::testing;
+
+fn unit_number(data: bytes::Bytes, value: isize, width: isize, endian: Endian) -> () {
+    for index in 0..width {
+        let shift = if endian == Endian::Little {
+            index * 8
+        } else {
+            (width - index - 1) * 8
+        };
+        data.push((value >> shift).to_u8());
+    }
+}
+
+fn unit_sections(version: isize, unit_type: byte, endian: Endian, codes: Vec[byte]) -> Sections {
+    let mut sections = Sections::empty();
+    sections.abbrev = bytes::Bytes::from_vec(
+        Vec::from_array(
+            [
+                1,
+                0x11,
+                0,
+                0,
+                0,
+                2,
+                0x11,
+                1,
+                0,
+                0,
+                3,
+                0x34,
+                0,
+                0,
+                0,
+                4,
+                0x0b,
+                1,
+                0,
+                0,
+                5,
+                0x3c,
+                0,
+                0,
+                0,
+                6,
+                0x3c,
+                1,
+                0,
+                0,
+                0,
+            ],
+        ),
+    );
+    let header_size = if version == 5 {
+        8
+    } else {
+        7
+    };
+    unit_number(sections.info, header_size + codes.len(), 4, endian);
+    unit_number(sections.info, version, 2, endian);
+    if version == 5 {
+        sections.info.push(unit_type);
+        sections.info.push(8);
+        unit_number(sections.info, 0, 4, endian);
+    } else {
+        unit_number(sections.info, 0, 4, endian);
+        sections.info.push(8);
+    }
+    for code in codes {
+        sections.info.push(code);
+    }
+    sections
+}
+
+fn invalid_unit_tree(sections: Sections, endian: Endian, offset: isize) -> () {
+    let basic = testing::expect_err(
+        dwarf::parse_sections(sections, endian, Limits::standard()),
+        "invalid DIE tree",
+    );
+    let detailed = testing::expect_err(
+        dwarf::parse_sections_detailed(sections, endian, Limits::standard()),
+        "invalid detailed DIE tree",
+    );
+    testing::assert_eq(basic, detailed);
+    testing::assert_eq(basic.kind, ErrorKind::Invalid);
+    testing::assert_eq(basic.section, ".debug_info");
+    testing::assert_eq(basic.offset, offset);
+}
+
+#[test]
+fn compilation_units_reject_multiple_root_entries() -> () {
+    for endian in Vec::from_array([Endian::Little, Endian::Big]) {
+        for version in Vec::from_array([2, 3, 4, 5]) {
+            let start = if version == 5 {
+                12
+            } else {
+                11
+            };
+            invalid_unit_tree(
+                unit_sections(version, 1, endian, Vec::from_array([1, 1])),
+                endian,
+                start + 1,
+            );
+            invalid_unit_tree(
+                unit_sections(version, 1, endian, Vec::from_array([2, 3, 0, 1])),
+                endian,
+                start + 3,
+            );
+        }
+    }
+}
+
+#[test]
+fn compilation_units_require_a_unit_root_tag() -> () {
+    for version in Vec::from_array([2, 3, 4, 5]) {
+        let start = if version == 5 {
+            12
+        } else {
+            11
+        };
+        invalid_unit_tree(
+            unit_sections(version, 1, Endian::Little, Vec::from_array([3])),
+            Endian::Little,
+            start,
+        );
+    }
+}
+
+#[test]
+fn compilation_unit_tags_cannot_be_nested() -> () {
+    for code in Vec::from_array([1, 5]) {
+        invalid_unit_tree(
+            unit_sections(4, 1, Endian::Little, Vec::from_array([2, code, 0])),
+            Endian::Little,
+            12,
+        );
+    }
+}
+
+#[test]
+fn dwarf5_root_tag_matches_unit_header() -> () {
+    invalid_unit_tree(unit_sections(5, 1, Endian::Little, Vec::from_array([5])), Endian::Little, 12);
+    invalid_unit_tree(unit_sections(5, 3, Endian::Little, Vec::from_array([1])), Endian::Little, 12);
+}
+
+#[test]
+fn valid_unit_trees_keep_child_depths_and_independent_unit_boundaries() -> () {
+    for endian in Vec::from_array([Endian::Little, Endian::Big]) {
+        for version in Vec::from_array([2, 3, 4, 5]) {
+            let sections = unit_sections(version, 1, endian, Vec::from_array([2, 4, 3, 0, 3, 0]));
+            let first_end = sections.info.len();
+            let second = unit_sections(version, 1, endian, Vec::from_array([1]));
+            sections.info.extend_from_slice(second.info.as_slice());
+            let parsed = testing::expect_ok(
+                dwarf::parse_sections(sections, endian, Limits::standard()),
+                "independent units",
+            );
+            testing::assert_eq(parsed.units.len(), 2);
+            testing::assert_eq(parsed.units[0].entries.len(), 4);
+            testing::assert_eq(parsed.units[0].entries[0].depth, 0);
+            testing::assert_eq(parsed.units[0].entries[1].depth, 1);
+            testing::assert_eq(parsed.units[0].entries[2].depth, 2);
+            testing::assert_eq(parsed.units[0].entries[3].depth, 1);
+            testing::assert_eq(parsed.units[0].end, first_end);
+            testing::assert_eq(parsed.units[1].offset, first_end);
+            testing::assert_eq(parsed.units[1].entries.len(), 1);
+            testing::assert_eq(parsed.units[1].entries[0].depth, 0);
+        }
+        for version in Vec::from_array([3, 4, 5]) {
+            for codes in Vec::from_array([Vec::from_array([5]), Vec::from_array([6, 3, 0])]) {
+                testing::assert_ok(
+                    dwarf::parse_sections(
+                        unit_sections(version, 3, endian, codes),
+                        endian,
+                        Limits::standard(),
+                    ),
+                );
+            }
+        }
+    }
+}
